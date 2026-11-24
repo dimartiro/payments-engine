@@ -10,10 +10,9 @@ publish = false
 csv = "1.4.0"
 env_logger = { version = "0.11.12", default-features = false }
 log = "0.4.35"
-# No `serde` feature: amounts are parsed by hand (see `amount.rs`), because
-# Decimal's serde impl goes through f64 with the csv crate and loses precision.
+# No `serde` feature: amounts are parsed by hand (see `amount.rs`), never
+# through Decimal's serde impl, which goes through f64 and loses precision.
 rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
-serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 
 [dev-dependencies]
@@ -32,3 +31,8 @@ panic = "warn"
 [profile.release]
 # Keep integer overflow checks in release builds: a wrapped balance is worse than a crash.
 overflow-checks = true
+
+[profile.dev]
+# `cargo run`, the documented way to run this, builds this profile. Level 1 is
+# several times faster than 0 and keeps debug assertions and overflow checks.
+opt-level = 1

@@ -1,22 +1,19 @@
-//! CSV input and output: the only module that deals with text, `csv` or `serde`.
+//! CSV input and output: the only module that deals with text or `csv`.
 //!
 //! Rows become [`Transaction`]s at this boundary ("parse, don't validate"), so
-//! the engine never sees a string. Reading is streaming: one reused record
-//! buffer, fields borrowed from it, so a row costs no heap allocation.
+//! the engine never sees a string. Reading streams: one reused record buffer,
+//! fields borrowed from it, so reading a row allocates nothing (except a row
+//! that isn't valid UTF-8, for csv's error).
 
 use std::io::{Read, Write};
 use std::str::FromStr;
 
 use csv::{ReaderBuilder, StringRecord, Trim};
-use serde::Deserialize;
 use thiserror::Error;
 
 use crate::amount::{Amount, AmountError};
 use crate::engine::Engine;
 use crate::transaction::{ClientId, Transaction, TransactionKind, TxId};
-
-/// Columns every input must have, in any order. Extra columns are ignored.
-const INPUT_COLUMNS: [&str; 4] = ["type", "client", "tx", "amount"];
 
 /// Output columns, in order.
 const OUTPUT_COLUMNS: [&str; 5] = ["client", "available", "held", "total", "locked"];
@@ -30,17 +27,28 @@ pub enum RunError {
     /// The header row lacks a required column.
     #[error("input header has no `{0}` column")]
     MissingColumn(&'static str),
+    /// The header row has a required column more than once, so which one to
+    /// read is ambiguous.
+    #[error("input header has more than one `{0}` column")]
+    DuplicateColumn(&'static str),
+    /// A field spans several lines. No valid field contains a line break, so
+    /// this is an unbalanced quote that swallowed the rows after it: balances
+    /// computed without them would be wrong.
+    #[error(
+        "data row {0}: a field spans several lines (unbalanced quote?), so later rows may be lost"
+    )]
+    LineBreakInField(u64),
     /// The output could not be written.
     #[error("cannot write output: {0}")]
     Write(csv::Error),
 }
 
 /// Why a data row was skipped as malformed. Reading continues with the next row.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum RowError {
-    /// Not valid UTF-8, or too few fields for a required column.
-    #[error("{0}")]
-    Csv(csv::Error),
+    /// The row is not valid UTF-8.
+    #[error("not valid UTF-8")]
+    InvalidUtf8,
     /// `type` is not one of `deposit`, `withdrawal`, `dispute`, `resolve`, `chargeback`.
     #[error("unknown transaction type")]
     UnknownType,
@@ -56,46 +64,101 @@ pub enum RowError {
     /// A deposit or withdrawal whose amount is not a valid [`Amount`].
     #[error("invalid amount: {0}")]
     Amount(AmountError),
+    /// Text in a field past the header's last column, e.g. an unquoted decimal
+    /// comma (`1,5`). Dropping it silently could change an amount.
+    #[error("more fields than the header has columns")]
+    ExtraField,
 }
 
 /// One data row: its position in the input, and its transaction or why it is
 /// malformed.
 #[derive(Debug)]
 pub struct Row {
-    /// 1-based number of the data row, for messages. The header and blank
-    /// lines don't count. (Not a line number: `csv` reports a row that follows
-    /// blank lines as starting on the first of them.)
+    /// 1-based number of the data row, for messages: csv's record index, where
+    /// the header is record 0 and empty lines don't count. Not a line number:
+    /// csv reports a row that follows empty lines as starting on the first of them.
     pub number: u64,
     pub transaction: Result<Transaction, RowError>,
 }
 
-/// A data row as written, matched to the header by column name. The fields
-/// borrow from the reader's record buffer.
-#[derive(Debug, Deserialize)]
-struct CsvRow<'a> {
-    #[serde(rename = "type")]
+/// Where the required columns are, found once from the header. Matching by
+/// name means any column order works and other columns are ignored.
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    kind: usize,
+    client: usize,
+    tx: usize,
+    amount: usize,
+    /// Number of header columns: fields past it must be empty.
+    width: usize,
+}
+
+impl Columns {
+    /// Finds each required column, which must appear exactly once.
+    fn locate(headers: &StringRecord) -> Result<Self, RunError> {
+        let find = |name: &'static str| {
+            let mut matches = headers
+                .iter()
+                .enumerate()
+                .filter(|&(_, header)| header == name);
+            match (matches.next(), matches.next()) {
+                (Some((index, _)), None) => Ok(index),
+                (None, _) => Err(RunError::MissingColumn(name)),
+                (Some(_), Some(_)) => Err(RunError::DuplicateColumn(name)),
+            }
+        };
+        Ok(Self {
+            kind: find("type")?,
+            client: find("client")?,
+            tx: find("tx")?,
+            amount: find("amount")?,
+            width: headers.len(),
+        })
+    }
+
+    /// The row's required fields, untrimmed. A field the row stops before
+    /// reads as empty: disputes, resolves and chargebacks may omit the amount.
+    fn fields<'r>(&self, record: &'r StringRecord) -> RawRow<'r> {
+        let field = |index| record.get(index).unwrap_or("");
+        RawRow {
+            kind: field(self.kind),
+            client: field(self.client),
+            tx: field(self.tx),
+            amount: field(self.amount),
+        }
+    }
+
+    /// Whether the row has text past the header's last column. Empty extra
+    /// fields, like a trailing comma, are fine.
+    fn has_extra_text(&self, record: &StringRecord) -> bool {
+        record
+            .iter()
+            .skip(self.width)
+            .any(|field| !field.trim().is_empty())
+    }
+}
+
+/// A data row's required fields as written, borrowed from the record buffer.
+struct RawRow<'a> {
     kind: &'a str,
     client: &'a str,
     tx: &'a str,
-    /// `None` when the field is empty or the row stops before it.
-    amount: Option<&'a str>,
+    amount: &'a str,
 }
 
-impl TryFrom<CsvRow<'_>> for Transaction {
+impl TryFrom<RawRow<'_>> for Transaction {
     type Error = RowError;
 
-    fn try_from(row: CsvRow<'_>) -> Result<Self, Self::Error> {
+    fn try_from(row: RawRow<'_>) -> Result<Self, Self::Error> {
         let client = parse_id(row.client)
             .map(ClientId)
             .ok_or(RowError::InvalidClient)?;
         let tx = parse_id(row.tx).map(TxId).ok_or(RowError::InvalidTx)?;
         // Only deposits and withdrawals read the amount; on the other kinds
         // whatever is there is ignored.
-        let amount = || {
-            let text = row.amount.map(str::trim).filter(|text| !text.is_empty());
-            text.ok_or(RowError::MissingAmount)?
-                .parse::<Amount>()
-                .map_err(RowError::Amount)
+        let amount = || match row.amount.trim() {
+            "" => Err(RowError::MissingAmount),
+            text => text.parse::<Amount>().map_err(RowError::Amount),
         };
         let kind = match row.kind.trim() {
             "deposit" => TransactionKind::Deposit(amount()?),
@@ -121,7 +184,8 @@ fn parse_id<T: FromStr>(text: &str) -> Option<T> {
 /// Streams transactions out of CSV input, one row at a time.
 pub struct TransactionReader<R> {
     csv: csv::Reader<R>,
-    headers: StringRecord,
+    /// `None` for empty input, which has no header and no rows.
+    columns: Option<Columns>,
     /// Reused for every row, so steady-state reading doesn't allocate.
     record: StringRecord,
 }
@@ -131,50 +195,57 @@ impl<R: Read> TransactionReader<R> {
     pub fn new(input: R) -> Result<Self, RunError> {
         let mut csv = ReaderBuilder::new()
             // Only the header is trimmed here: csv's per-field trimming
-            // allocates a new record per row, so `CsvRow` fields are trimmed
-            // when parsed instead.
+            // allocates a new record per row, so fields are trimmed when
+            // parsed instead.
             .trim(Trim::Headers)
             // Disputes, resolves and chargebacks may stop before the amount.
             .flexible(true)
             .from_reader(input);
-        let headers = csv.headers().map_err(RunError::Read)?.clone();
-
-        let is_empty_input = headers.is_empty();
-        if !is_empty_input {
-            let has = |column: &str| headers.iter().any(|header| header == column);
-            if let Some(missing) = INPUT_COLUMNS.into_iter().find(|column| !has(column)) {
-                return Err(RunError::MissingColumn(missing));
-            }
-        }
+        let headers = csv.headers().map_err(RunError::Read)?;
+        // A 0-byte input (or only empty lines) has an empty header record.
+        let columns = if headers.is_empty() {
+            None
+        } else {
+            Some(Columns::locate(headers)?)
+        };
         Ok(Self {
             csv,
-            headers,
+            columns,
             record: StringRecord::new(),
         })
     }
 
     /// The next data row, `None` at the end of the input, or a fatal error if
-    /// the input can no longer be read.
+    /// the input can no longer be read reliably.
     pub fn next_row(&mut self) -> Result<Option<Row>, RunError> {
-        let transaction = match self.csv.read_record(&mut self.record) {
-            Ok(false) => return Ok(None),
-            Ok(true) => self
-                .record
-                .deserialize::<CsvRow>(Some(&self.headers))
-                .map_err(RowError::Csv)
-                .and_then(Transaction::try_from),
-            Err(err) if err.is_io_error() => return Err(RunError::Read(err)),
-            // Invalid UTF-8: this row is lost, but the next one is readable.
-            Err(err) => {
-                let number = err.position().map_or(0, csv::Position::record);
-                return Ok(Some(Row {
-                    number,
-                    transaction: Err(RowError::Csv(err)),
-                }));
-            }
+        let Some(columns) = self.columns else {
+            return Ok(None);
         };
+        match self.csv.read_record(&mut self.record) {
+            Ok(true) => {}
+            Ok(false) => return Ok(None),
+            // Invalid UTF-8 loses only this row; anything else (I/O) is fatal.
+            Err(err) => {
+                return match err.kind() {
+                    csv::ErrorKind::Utf8 { .. } => Ok(Some(Row {
+                        number: err.position().map_or(0, csv::Position::record),
+                        transaction: Err(RowError::InvalidUtf8),
+                    })),
+                    _ => Err(RunError::Read(err)),
+                };
+            }
+        }
+
         // The header is record 0, so data rows count from 1.
         let number = self.record.position().map_or(0, csv::Position::record);
+        if self.record.as_slice().contains(['\n', '\r']) {
+            return Err(RunError::LineBreakInField(number));
+        }
+        let transaction = if columns.has_extra_text(&self.record) {
+            Err(RowError::ExtraField)
+        } else {
+            Transaction::try_from(columns.fields(&self.record))
+        };
         Ok(Some(Row {
             number,
             transaction,
@@ -312,23 +383,20 @@ mod tests {
     #[test]
     fn deposit_or_withdrawal_without_an_amount_is_malformed() {
         for row in ["deposit,1,2", "deposit,1,2,", "withdrawal,1,2, "] {
-            assert!(
-                matches!(parse(row), Err(RowError::MissingAmount)),
-                "row {row:?}"
-            );
+            assert_eq!(parse(row), Err(RowError::MissingAmount), "row {row:?}");
         }
     }
 
     #[test]
     fn invalid_amount_is_malformed() {
-        assert!(matches!(
+        assert_eq!(
             parse("deposit,1,2,-1"),
             Err(RowError::Amount(AmountError::InvalidFormat))
-        ));
-        assert!(matches!(
+        );
+        assert_eq!(
             parse("deposit,1,2,1.23456"),
             Err(RowError::Amount(AmountError::TooPrecise))
-        ));
+        );
     }
 
     #[test]
@@ -339,10 +407,7 @@ mod tests {
             "transfer,1,2,1",
             ",1,2,1",
         ] {
-            assert!(
-                matches!(parse(row), Err(RowError::UnknownType)),
-                "row {row:?}"
-            );
+            assert_eq!(parse(row), Err(RowError::UnknownType), "row {row:?}");
         }
     }
 
@@ -350,8 +415,9 @@ mod tests {
     fn client_must_be_a_u16_written_as_digits() {
         for client in ["70000", "65536", "-1", "+1", "0x1F", "1.0", "", "one"] {
             let row = format!("deposit,{client},2,1");
-            assert!(
-                matches!(parse(&row), Err(RowError::InvalidClient)),
+            assert_eq!(
+                parse(&row),
+                Err(RowError::InvalidClient),
                 "client {client:?}"
             );
         }
@@ -365,16 +431,55 @@ mod tests {
     fn tx_must_be_a_u32_written_as_digits() {
         for tx in ["4294967296", "-1", "+1", "1e3", ""] {
             let row = format!("deposit,1,{tx},1");
-            assert!(matches!(parse(&row), Err(RowError::InvalidTx)), "tx {tx:?}");
+            assert_eq!(parse(&row), Err(RowError::InvalidTx), "tx {tx:?}");
         }
         assert_eq!(parse("deposit,1,4294967295,1").unwrap().tx, TxId(u32::MAX));
     }
 
     #[test]
-    fn row_missing_a_required_field_is_malformed_and_reading_continues() {
+    fn row_stopping_before_a_required_field_is_malformed_and_reading_continues() {
         let rows = rows("type,client,tx,amount\ndeposit,1\ndeposit,1,2,3\n");
-        assert!(matches!(rows[0].transaction, Err(RowError::Csv(_))));
+        assert_eq!(rows[0].transaction, Err(RowError::InvalidTx));
         assert!(rows[1].transaction.is_ok());
+    }
+
+    #[test]
+    fn extra_header_columns_do_not_require_longer_rows() {
+        // A trailing comma in the header adds an unnamed column.
+        let trailing_comma = rows("type,client,tx,amount,\ndeposit,1,1,1\ndispute,1,1\n");
+        let deposit = transaction(1, 1, TransactionKind::Deposit(amount("1")));
+        assert_eq!(trailing_comma[0].transaction, Ok(deposit));
+        assert_eq!(
+            trailing_comma[1].transaction,
+            Ok(transaction(1, 1, TransactionKind::Dispute))
+        );
+
+        let named_extra = rows("type,client,tx,note,amount\ndispute,7,11\n");
+        assert_eq!(
+            named_extra[0].transaction,
+            Ok(transaction(7, 11, TransactionKind::Dispute))
+        );
+    }
+
+    #[test]
+    fn text_past_the_last_header_column_is_malformed() {
+        // An unquoted decimal comma must not turn 1,5 into a deposit of 1.
+        assert_eq!(parse("deposit,1,1,1,5"), Err(RowError::ExtraField));
+        // Empty extra fields (trailing commas) are fine.
+        assert!(parse("deposit,1,1,1,").is_ok());
+        assert!(parse("dispute,1,1,, ,").is_ok());
+    }
+
+    #[test]
+    fn field_spanning_several_lines_is_fatal() {
+        // An unbalanced quote swallows every row after it into one field.
+        let input = "type,client,tx,amount\ndeposit,1,1,10\ndispute,1,1,\"\ndeposit,2,2,5\n";
+        let mut reader = TransactionReader::new(input.as_bytes()).unwrap();
+        assert!(reader.next_row().unwrap().unwrap().transaction.is_ok());
+        assert!(matches!(
+            reader.next_row(),
+            Err(RunError::LineBreakInField(2))
+        ));
     }
 
     #[test]
@@ -382,7 +487,7 @@ mod tests {
         let input = b"type,client,tx,amount\ndeposit,1,2,\xff\ndeposit,1,3,1\n";
         let mut reader = TransactionReader::new(&input[..]).unwrap();
         let first = reader.next_row().unwrap().unwrap();
-        assert!(matches!(first.transaction, Err(RowError::Csv(_))));
+        assert_eq!(first.transaction, Err(RowError::InvalidUtf8));
         assert_eq!(first.number, 1);
         let second = reader.next_row().unwrap().unwrap();
         assert_eq!(second.transaction.unwrap().tx, TxId(3));
@@ -405,8 +510,15 @@ mod tests {
 
     #[test]
     fn empty_input_and_header_only_input_have_no_rows() {
-        assert!(rows("").is_empty());
-        assert!(rows("type,client,tx,amount\n").is_empty());
+        for input in [
+            "",
+            "\n\n",
+            "\r\n\r\n",
+            "\u{feff}",
+            "type,client,tx,amount\n",
+        ] {
+            assert!(rows(input).is_empty(), "input {input:?}");
+        }
     }
 
     #[test]
@@ -422,6 +534,19 @@ mod tests {
         assert_eq!(missing("deposit,1,1,1.0\n"), "type");
     }
 
+    #[test]
+    fn header_repeating_a_required_column_is_fatal() {
+        let duplicate = |input: &str| match TransactionReader::new(input.as_bytes()) {
+            Err(RunError::DuplicateColumn(column)) => column,
+            other => panic!("expected DuplicateColumn, got {:?}", other.err()),
+        };
+        assert_eq!(duplicate("type,client,tx,amount,amount\n"), "amount");
+        // Names are compared after trimming.
+        assert_eq!(duplicate("type,client,tx, tx ,amount\n"), "tx");
+        // Repeated columns that aren't required are fine.
+        assert!(TransactionReader::new("type,client,tx,amount,note,note\n".as_bytes()).is_ok());
+    }
+
     // ---- writing -----------------------------------------------------------
 
     fn written(engine: &Engine) -> String {
@@ -430,6 +555,7 @@ mod tests {
         String::from_utf8(output).unwrap()
     }
 
+    #[track_caller]
     fn engine_with(transactions: &[Transaction]) -> Engine {
         let mut engine = Engine::new();
         for &t in transactions {

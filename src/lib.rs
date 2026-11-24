@@ -50,8 +50,8 @@ pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<Stats, RunError> {
 /// Applies every transaction in `input` to `engine`, one row at a time.
 ///
 /// Malformed rows and refused transactions are logged and skipped: the spec
-/// treats them as partner errors, not reasons to stop. Only an unreadable
-/// input or header is fatal.
+/// treats them as partner errors, not reasons to stop. Only input that can't
+/// be read reliably is fatal (see [`RunError`]).
 pub fn process<R: Read>(engine: &mut Engine, input: R) -> Result<Stats, RunError> {
     let mut reader = TransactionReader::new(input)?;
     let mut stats = Stats::default();
@@ -60,7 +60,7 @@ pub fn process<R: Read>(engine: &mut Engine, input: R) -> Result<Stats, RunError
             Ok(transaction) => transaction,
             Err(err) => {
                 stats.malformed += 1;
-                info!("row {}: skipped as malformed: {err}", row.number);
+                info!("data row {}: skipped as malformed: {err}", row.number);
                 continue;
             }
         };
@@ -73,7 +73,11 @@ pub fn process<R: Read>(engine: &mut Engine, input: R) -> Result<Stats, RunError
                 } else {
                     Level::Debug
                 };
-                log!(level, "row {}: refused {transaction:?}: {err}", row.number);
+                log!(
+                    level,
+                    "data row {}: refused {transaction:?}: {err}",
+                    row.number
+                );
             }
         }
     }
@@ -151,6 +155,14 @@ mod tests {
     fn missing_column_is_fatal_and_writes_nothing() {
         let (result, output) = run_str("type,client,amount\ndeposit,1,1\n");
         assert!(matches!(result, Err(RunError::MissingColumn("tx"))));
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn unbalanced_quote_is_fatal_and_writes_nothing() {
+        let (result, output) =
+            run_str("type,client,tx,amount\ndeposit,1,1,1\ndispute,1,1,\"\ndeposit,2,2,1\n");
+        assert!(matches!(result, Err(RunError::LineBreakInField(2))));
         assert_eq!(output, "");
     }
 
