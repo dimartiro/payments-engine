@@ -77,8 +77,8 @@ impl FromStr for Amount {
         }
         // `rust_decimal`'s parser recurses once per input byte and only bounds
         // the depth after a nonzero digit, so a long run of leading zeros
-        // overflows the stack in unoptimized builds (what `cargo run` makes).
-        // Dropping them is free and leaves at most ~57 bytes to parse.
+        // overflows the stack when built with `opt-level = 0`. Dropping them is
+        // free and leaves at most ~57 bytes to parse, however this is compiled.
         let s = match s.trim_start_matches('0') {
             "" | "." => "0",
             rest => rest,
@@ -210,7 +210,8 @@ mod tests {
 
     #[test]
     fn long_runs_of_leading_zeros_do_not_overflow_the_stack() {
-        // Runs on a 2 MiB test thread; before the fix, 10_000 zeros aborted it.
+        // Without the guard this aborts the 2 MiB test thread, but only when
+        // built with `opt-level = 0`: `CARGO_PROFILE_DEV_OPT_LEVEL=0 cargo test long_runs`.
         let zeros = "0".repeat(100_000);
         assert_eq!(
             format!("{zeros}1").parse::<Amount>().unwrap().value(),
