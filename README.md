@@ -19,6 +19,7 @@ cargo run -- transactions.csv > accounts.csv
 - [Efficiency](#efficiency)
 - [Many concurrent streams](#many-concurrent-streams)
 - [Limitations and future work](#limitations-and-future-work)
+- [Use of AI](#use-of-ai)
 
 ## Usage
 
@@ -343,3 +344,23 @@ because ids are unique by contract.
   longest row). A server should cap it.
 - **Fuzzing** the parser with `cargo-fuzz` would complement the property test,
   which already feeds the engine random transactions.
+
+## Use of AI
+
+I built this with Claude Code, an AI coding assistant, in a single session.
+[`prompts.txt`](prompts.txt) is the transcript: every prompt I wrote, every
+reply, and a line for each action the assistant took.
+
+- **Planning.** I had it read the challenge and propose a step-by-step plan
+  with maintainability and performance as the priorities. It drafted three
+  independent plans and merged the best one with ideas from the others.
+- **Implementation, one step at a time.** I chose each step (scaffold, domain
+  types, engine, CSV input and output, sample data, README) and decided when
+  to commit.
+- **Review.** After each step it ran independent reviews: adversarial code
+  review, a property test against a reference model, mutation testing of the
+  sample data, and a fact-check of this README. A second agent tried to
+  reproduce each finding before it was fixed.
+- **Decisions.** Where the specification is ambiguous I made the final call
+  (see [Assumptions](#assumptions)). I mostly followed its recommendations, but
+  chose a silent stderr instead of a warning summary.
