@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use env_logger::Env;
-use log::{info, warn};
+use log::info;
 use payments_engine::csv_io::RunError;
 
 const USAGE: &str = "usage: payments-engine <transactions.csv>";
@@ -29,8 +29,9 @@ fn main() -> ExitCode {
     };
     let path = PathBuf::from(path);
 
-    // Logs go to stderr and are quiet by default. `RUST_LOG=info` lists
-    // skipped malformed rows; `RUST_LOG=debug` also lists refused transactions.
+    // A successful run writes nothing to stderr. Diagnostics are opt-in:
+    // `RUST_LOG=info` lists skipped malformed rows, `RUST_LOG=debug` also
+    // refused transactions. (Warnings are reserved for bugs.)
     env_logger::Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     let input = match File::open(&path) {
@@ -49,12 +50,6 @@ fn main() -> ExitCode {
                 "{} applied, {} refused, {} malformed",
                 stats.applied, stats.refused, stats.malformed
             );
-            if stats.malformed > 0 {
-                warn!(
-                    "skipped {} malformed row(s); run with RUST_LOG=info for details",
-                    stats.malformed
-                );
-            }
             ExitCode::SUCCESS
         }
         Err(err @ RunError::Write(_)) => {

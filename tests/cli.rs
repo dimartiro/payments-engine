@@ -89,24 +89,30 @@ fn structurally_broken_input_fails_without_printing_balances() {
 }
 
 #[test]
-fn skipped_rows_still_succeed_with_a_single_warning() {
+fn skipped_and_refused_rows_still_succeed_silently() {
     let input = "type,client,tx,amount\ndeposit,1,1,1\nbogus,1,2,1\nwithdrawal,1,3,5\n";
-    let output = binary()
-        .arg(input_file("skipped_rows.csv", input))
-        .output()
-        .unwrap();
+    let path = input_file("skipped_rows.csv", input);
+    let output = binary().arg(&path).output().unwrap();
 
     assert_eq!(output.status.code(), Some(0));
-    let expected = format!("{HEADER}1,1.0000,0.0000,1.0000,false\n");
-    assert_eq!(stdout(&output), expected);
-    // The malformed row gives one summary line; the refused withdrawal is
-    // logged only at debug level.
+    assert_eq!(
+        stdout(&output),
+        format!("{HEADER}1,1.0000,0.0000,1.0000,false\n")
+    );
+    assert!(output.stderr.is_empty(), "stderr: {}", stderr(&output));
+
+    // Diagnostics are opt-in.
+    let output = binary()
+        .arg(&path)
+        .env("RUST_LOG", "debug")
+        .output()
+        .unwrap();
     let stderr = stderr(&output);
-    assert_eq!(stderr.lines().count(), 1, "stderr: {stderr}");
     assert!(
-        stderr.contains("skipped 1 malformed row(s)"),
+        stderr.contains("data row 2: skipped as malformed"),
         "stderr: {stderr}"
     );
+    assert!(stderr.contains("data row 3: refused"), "stderr: {stderr}");
 }
 
 #[test]
