@@ -50,3 +50,12 @@ pub enum TxError {
     #[error("transaction was already charged back")]
     AlreadyChargedBack,
 }
+
+impl TxError {
+    /// `true` for the two invariant guards the engine never triggers on its
+    /// own: seeing one from [`Engine::apply`](crate::engine::Engine::apply)
+    /// means a bug, not bad input.
+    pub fn indicates_bug(self) -> bool {
+        matches!(self, Self::InsufficientHeldFunds | Self::Overflow)
+    }
+}
