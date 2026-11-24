@@ -1,0 +1,5 @@
+client,tx,note,type,amount
+1,1,salary,deposit,12
+1,2,,withdrawal,2.5
+2,3,gift,deposit,7
+1,1,,dispute
