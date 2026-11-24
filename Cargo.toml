@@ -2,5 +2,33 @@
 name = "payments-engine"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A streaming toy payments engine: reads transactions from CSV and writes client account balances as CSV."
+publish = false
 
 [dependencies]
+csv = "1.4.0"
+env_logger = { version = "0.11.12", default-features = false }
+log = "0.4.35"
+# No `serde` feature: amounts are parsed by hand (see `amount.rs`), because
+# Decimal's serde impl goes through f64 with the csv crate and loses precision.
+rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.11.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Warn locally; CI runs clippy with `-D warnings`, so these fail the build there.
+# Tests opt out explicitly with `#[allow(...)]`.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+# Keep integer overflow checks in release builds: a wrapped balance is worse than a crash.
+overflow-checks = true
