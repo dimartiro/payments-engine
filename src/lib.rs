@@ -5,9 +5,12 @@
 //! balances as CSV.
 //!
 //! Reading order: [`transaction`] (what comes in), [`amount`] (how money is
-//! validated), [`account`] (the balance rules), [`error`].
+//! validated), [`engine`] (how each transaction is applied), [`dispute`] (the
+//! dispute lifecycle), [`account`] (the balance rules), [`error`].
 
 pub mod account;
 pub mod amount;
+pub mod dispute;
+pub mod engine;
 pub mod error;
 pub mod transaction;
