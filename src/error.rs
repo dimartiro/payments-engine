@@ -2,10 +2,14 @@
 
 use thiserror::Error;
 
-/// Why a well-formed transaction was refused by the business rules.
+/// Why a well-formed transaction was refused.
 ///
-/// A refused transaction is skipped and changes nothing; it is never fatal
-/// for the run (the spec treats these as errors on the partner's side).
+/// A refusal is never fatal: the transaction is skipped and no balances or
+/// dispute records change (see [`Engine`](crate::engine::Engine) for the one
+/// account a refusal may still create). The spec calls bad dispute, resolve
+/// and chargeback references errors on the partner's side; the other variants
+/// are ordinary business refusals, plus two invariant guards
+/// (`InsufficientHeldFunds`, `Overflow`) that the engine never triggers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum TxError {
     /// The account is frozen after a chargeback and refuses client-initiated movements.
@@ -15,9 +19,16 @@ pub enum TxError {
     #[error("insufficient available funds")]
     InsufficientFunds,
     /// Releasing or charging back more than is currently held.
+    ///
+    /// Guards `Account`'s "held is never negative" invariant for direct
+    /// callers. The engine only releases or charges back an amount it held
+    /// earlier, so seeing this from `Engine::apply` means a bug, not bad input.
     #[error("insufficient held funds")]
     InsufficientHeldFunds,
-    /// A balance would leave the exactly representable range.
+    /// A balance would exceed [`Account::MAX_BALANCE`](crate::account::Account::MAX_BALANCE),
+    /// beyond which `Decimal` arithmetic would no longer be exact.
+    ///
+    /// Unreachable through the engine, which can't accumulate that much.
     #[error("balance overflow")]
     Overflow,
     /// A deposit reused the id of an earlier accepted deposit.

@@ -51,7 +51,8 @@ pub enum AmountError {
     /// digits to represent at all.
     #[error("not a plain decimal number")]
     InvalidFormat,
-    /// More than four decimal places after removing trailing zeros.
+    /// More than four decimal places after removing trailing zeros. (Text with
+    /// more digits than a `Decimal` can hold at all is `InvalidFormat`.)
     #[error("more than {} decimal places", Amount::SCALE)]
     TooPrecise,
     /// Zero or negative.
@@ -74,6 +75,14 @@ impl FromStr for Amount {
         if !is_plain_decimal(s) {
             return Err(AmountError::InvalidFormat);
         }
+        // `rust_decimal`'s parser recurses once per input byte and only bounds
+        // the depth after a nonzero digit, so a long run of leading zeros
+        // overflows the stack in unoptimized builds (what `cargo run` makes).
+        // Dropping them is free and leaves at most ~57 bytes to parse.
+        let s = match s.trim_start_matches('0') {
+            "" | "." => "0",
+            rest => rest,
+        };
         // `from_str_exact` errors instead of rounding when the text has more
         // digits than a `Decimal` can hold.
         let value = Decimal::from_str_exact(s).map_err(|_| AmountError::InvalidFormat)?;
@@ -108,7 +117,11 @@ fn is_plain_decimal(s: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "a failed unwrap is a failed test"
+)]
 mod tests {
     use super::*;
 
@@ -190,6 +203,32 @@ mod tests {
             assert_eq!(
                 input.parse::<Amount>(),
                 Err(AmountError::TooLarge),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_runs_of_leading_zeros_do_not_overflow_the_stack() {
+        // Runs on a 2 MiB test thread; before the fix, 10_000 zeros aborted it.
+        let zeros = "0".repeat(100_000);
+        assert_eq!(
+            format!("{zeros}1").parse::<Amount>().unwrap().value(),
+            dec("1")
+        );
+        assert_eq!(
+            format!("{zeros}.5").parse::<Amount>().unwrap().value(),
+            dec("0.5")
+        );
+        assert_eq!(zeros.parse::<Amount>(), Err(AmountError::NotPositive));
+    }
+
+    #[test]
+    fn zero_written_any_way_is_not_positive() {
+        for input in ["0.", ".0", "00.", "000.000"] {
+            assert_eq!(
+                input.parse::<Amount>(),
+                Err(AmountError::NotPositive),
                 "input {input:?}"
             );
         }

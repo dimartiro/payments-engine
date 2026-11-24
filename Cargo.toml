@@ -24,7 +24,7 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 # Warn locally; CI runs clippy with `-D warnings`, so these fail the build there.
-# Tests opt out explicitly with `#[allow(...)]`.
+# Tests opt out explicitly with `#[expect(..., reason = ...)]`.
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"

@@ -79,7 +79,10 @@ impl DepositRecord {
 
 // One record is kept per accepted deposit, so its size drives the engine's
 // memory use. Changing it should be a deliberate decision.
-const _: () = assert!(std::mem::size_of::<DepositRecord>() == 20);
+const _: () = assert!(
+    std::mem::size_of::<DepositRecord>() == 20,
+    "DepositRecord changed size: update the per-deposit memory figures in the README",
+);
 
 #[cfg(test)]
 mod tests {

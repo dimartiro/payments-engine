@@ -9,7 +9,8 @@ use crate::dispute::{DepositRecord, DisputeEvent};
 use crate::error::TxError;
 use crate::transaction::{ClientId, Transaction, TransactionKind, TxId};
 
-/// All client accounts plus the deposits that may still be disputed.
+/// All client accounts plus every accepted deposit, kept for good (charged-back
+/// ones included) so later references to it are recognised and its id stays taken.
 ///
 /// [`Engine::apply`] is all-or-nothing: when it returns an error, the engine
 /// is exactly as it was before the call. The one documented exception is a
@@ -72,7 +73,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Debits the client if enough funds are available.
+    /// Debits the client if the account is unlocked and has enough available
+    /// funds. The account is created even when the withdrawal is refused: the
+    /// one exception to all-or-nothing (see [`Engine`]).
     fn withdraw(&mut self, client: ClientId, amount: Amount) -> Result<(), TxError> {
         self.accounts.entry(client).or_default().withdraw(amount)
     }
@@ -82,6 +85,9 @@ impl Engine {
     /// Checks, in order: the deposit exists, it belongs to `client`, the
     /// event is allowed in the deposit's current state, and the balance
     /// change succeeds. The new state is saved only after all of them pass.
+    ///
+    /// Through [`Engine::apply`] the balance change cannot fail (held always
+    /// covers every disputed deposit), so saving the state last is defensive.
     fn dispute_step(
         &mut self,
         client: ClientId,
@@ -94,9 +100,10 @@ impl Engine {
         }
         let next_state = record.state.next(event)?;
 
-        // Never creates an account: the deposit was applied to this client's
-        // account, and accounts are never removed.
-        let account = self.accounts.entry(client).or_default();
+        // Cannot fail: a record exists only after its deposit credited this
+        // client's account, and accounts are never removed. If that ever broke,
+        // refusing keeps the engine unchanged instead of inventing an account.
+        let account = self.accounts.get_mut(&client).ok_or(TxError::UnknownTx)?;
         match event {
             DisputeEvent::Dispute => account.hold(record.amount),
             DisputeEvent::Resolve => account.release(record.amount),
@@ -109,11 +116,12 @@ impl Engine {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "a failed unwrap is a failed test")]
 mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
+    use crate::dispute::DisputeState;
 
     // ---- builders ------------------------------------------------------
 
@@ -150,12 +158,15 @@ mod tests {
     }
 
     /// An engine with `transactions` applied, each of which must succeed.
+    #[track_caller]
     fn engine_with(transactions: &[Transaction]) -> Engine {
         let mut engine = Engine::new();
         for &t in transactions {
-            engine
-                .apply(t)
-                .unwrap_or_else(|e| unreachable!("setup {t:?} refused: {e}"));
+            assert_eq!(
+                engine.apply(t),
+                Ok(()),
+                "setup transaction {t:?} was refused"
+            );
         }
         engine
     }
@@ -217,12 +228,25 @@ mod tests {
 
     #[test]
     fn refused_withdrawal_still_creates_an_empty_account_for_a_new_client() {
-        let mut engine = Engine::new();
+        // The one exception to all-or-nothing, and nothing beyond it.
+        let mut engine = engine_with(&[deposit(1, 1, "2")]);
+        let mut expected = engine.clone();
+        expected.accounts.insert(ClientId(7), Account::default());
+
         assert_eq!(
-            engine.apply(withdrawal(7, 1, "1")),
+            engine.apply(withdrawal(7, 2, "1")),
             Err(TxError::InsufficientFunds)
         );
-        assert_account(&engine, 7, "0", "0", "0", false);
+        assert_eq!(engine, expected);
+    }
+
+    #[test]
+    fn withdrawal_ids_are_not_tracked() {
+        // Ids are unique per the spec; only deposit ids are remembered, so a
+        // withdrawal reusing a deposit's id is accepted and the dispute still
+        // finds the deposit.
+        let engine = engine_with(&[deposit(1, 1, "5"), withdrawal(1, 1, "2"), dispute(1, 1)]);
+        assert_account(&engine, 1, "-2", "5", "3", false);
     }
 
     #[test]
@@ -399,7 +423,21 @@ mod tests {
         let mut engine = locked_engine();
         assert_account(&engine, 1, "8", "0", "8", true);
         assert_refused(&mut engine, deposit(1, 10, "1"), TxError::AccountLocked);
-        assert_refused(&mut engine, withdrawal(1, 11, "1"), TxError::AccountLocked);
+        // More than available: the lock is reported first.
+        assert_refused(
+            &mut engine,
+            withdrawal(1, 11, "100"),
+            TxError::AccountLocked,
+        );
+        // A duplicate id is reported before the lock.
+        assert_refused(&mut engine, deposit(1, 3, "1"), TxError::DuplicateTx);
+    }
+
+    #[test]
+    fn charged_back_deposit_id_stays_taken() {
+        let mut engine = locked_engine();
+        assert_refused(&mut engine, deposit(2, 3, "5"), TxError::DuplicateTx);
+        assert!(engine.account(ClientId(2)).is_none());
     }
 
     #[test]
@@ -421,5 +459,32 @@ mod tests {
         // The id was never used, so another client can still deposit with it.
         engine.apply(deposit(2, 10, "1")).unwrap();
         assert_account(&engine, 2, "1", "0", "1", false);
+    }
+
+    // ---- defensive paths (unreachable through `apply` alone) -------------
+
+    #[test]
+    fn failed_balance_change_does_not_advance_the_dispute_state() {
+        // Mark an undisputed deposit as disputed without holding its funds:
+        // releasing or charging it back would push held below zero.
+        let mut engine = engine_with(&[deposit(1, 1, "4")]);
+        engine.deposits.get_mut(&TxId(1)).unwrap().state = DisputeState::Disputed;
+
+        assert_refused(&mut engine, resolve(1, 1), TxError::InsufficientHeldFunds);
+        assert_refused(
+            &mut engine,
+            chargeback(1, 1),
+            TxError::InsufficientHeldFunds,
+        );
+    }
+
+    #[test]
+    fn deposit_record_without_an_account_is_refused_without_creating_one() {
+        let mut engine = Engine::new();
+        let record = DepositRecord::new(ClientId(9), amount("1"));
+        engine.deposits.insert(TxId(1), record);
+
+        assert_refused(&mut engine, dispute(9, 1), TxError::UnknownTx);
+        assert!(engine.account(ClientId(9)).is_none());
     }
 }

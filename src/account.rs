@@ -7,10 +7,12 @@ use crate::error::TxError;
 
 /// The balances of one client.
 ///
-/// Fields are private and every change goes through [`Account::apply_delta`],
-/// so these invariants hold everywhere:
+/// Fields are private. Every balance change goes through `apply_delta`, and
+/// `locked` is only ever set (never cleared) by `charge_back`, after its
+/// balance change succeeded. So these invariants hold everywhere:
 /// - `total` is always `available + held`: it is computed, never stored;
 /// - `held` is never negative;
+/// - every balance stays within ±[`Account::MAX_BALANCE`], so all arithmetic is exact;
 /// - a failed operation leaves the account exactly as it was.
 ///
 /// `available` *can* be negative: disputing a deposit whose funds were already
@@ -22,7 +24,26 @@ pub struct Account {
     locked: bool,
 }
 
+/// [`Account::MAX_BALANCE`] in whole units: 2^32 deposits of 1e15 each.
+const MAX_BALANCE_UNITS: u128 = (1 << 32) * 1_000_000_000_000_000;
+
 impl Account {
+    /// Largest absolute balance an account may reach: 2^32 × [`Amount::MAX`],
+    /// about 4.3e24.
+    ///
+    /// The engine can never reach it: it accepts at most 2^32 deposits (one
+    /// per `u32` id), each at most `Amount::MAX`. The bound is for direct users
+    /// of `Account`: past about 7.9e24, `Decimal` addition silently rounds
+    /// away decimal places instead of failing, and this keeps every result exact.
+    pub const MAX_BALANCE: Decimal = Decimal::from_parts(
+        // The three 32-bit words of the 96-bit mantissa, low to high.
+        MAX_BALANCE_UNITS as u32,
+        (MAX_BALANCE_UNITS >> 32) as u32,
+        (MAX_BALANCE_UNITS >> 64) as u32,
+        false,
+        0,
+    );
+
     /// Funds the client can use or withdraw now: `total - held`.
     pub fn available(&self) -> Decimal {
         self.available
@@ -35,7 +56,8 @@ impl Account {
 
     /// Available plus held funds.
     pub fn total(&self) -> Decimal {
-        // Cannot overflow: `apply_delta` only commits balances whose sum is representable.
+        // Exact and cannot overflow: `apply_delta` only commits balances whose
+        // sum is within `MAX_BALANCE`.
         self.available + self.held
     }
 
@@ -96,19 +118,29 @@ impl Account {
 
     /// The single place balances change.
     ///
-    /// Computes every new value with checked arithmetic first and assigns only
-    /// after all checks pass, so an error leaves the account untouched.
+    /// Computes every new value first and assigns only after all checks pass,
+    /// so an error leaves the account untouched.
+    ///
+    /// Why the results are exact: committed balances are within `MAX_BALANCE`
+    /// and a delta is at most `Amount::MAX`, so the new `available` and `held`
+    /// are far below where `Decimal` starts rounding. Only `total` could round,
+    /// and only when it is already beyond `MAX_BALANCE`, where it is refused.
     fn apply_delta(&mut self, d_available: Decimal, d_held: Decimal) -> Result<(), TxError> {
         let available = self
             .available
             .checked_add(d_available)
             .ok_or(TxError::Overflow)?;
         let held = self.held.checked_add(d_held).ok_or(TxError::Overflow)?;
+        let total = available.checked_add(held).ok_or(TxError::Overflow)?;
+        if [available, held, total]
+            .iter()
+            .any(|v| v.abs() > Self::MAX_BALANCE)
+        {
+            return Err(TxError::Overflow);
+        }
         if held < Decimal::ZERO {
             return Err(TxError::InsufficientHeldFunds);
         }
-        // Checked here so that `total()` can use plain addition.
-        available.checked_add(held).ok_or(TxError::Overflow)?;
 
         self.available = available;
         self.held = held;
@@ -117,7 +149,7 @@ impl Account {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[expect(clippy::unwrap_used, reason = "a failed unwrap is a failed test")]
 mod tests {
     use super::*;
 
@@ -279,7 +311,8 @@ mod tests {
         let before = account.clone();
 
         assert_eq!(account.deposit(amount("1")), Err(TxError::AccountLocked));
-        assert_eq!(account.withdraw(amount("1")), Err(TxError::AccountLocked));
+        // More than available: the lock is reported first.
+        assert_eq!(account.withdraw(amount("100")), Err(TxError::AccountLocked));
         assert_eq!(account, before);
     }
 
@@ -322,13 +355,41 @@ mod tests {
     }
 
     #[test]
-    fn overflow_is_an_error_and_changes_nothing() {
+    fn max_balance_is_the_most_the_engine_can_accumulate() {
+        let max_deposits = Decimal::from(1_u64 << 32);
+        assert_eq!(Account::MAX_BALANCE, Amount::MAX.value() * max_deposits);
+    }
+
+    #[test]
+    fn balances_up_to_max_balance_are_exact() {
+        let just_below = Account::MAX_BALANCE - dec("0.0001");
         let mut account = Account {
-            available: Decimal::MAX,
+            available: just_below,
+            ..Account::default()
+        };
+        account.deposit(amount("0.0001")).unwrap();
+        assert_eq!(account.available(), Account::MAX_BALANCE);
+    }
+
+    #[test]
+    fn exceeding_max_balance_is_an_overflow_and_changes_nothing() {
+        // Positive side: one more deposit.
+        let mut account = Account {
+            available: Account::MAX_BALANCE,
             ..Account::default()
         };
         let before = account.clone();
-        assert_eq!(account.deposit(amount("1")), Err(TxError::Overflow));
+        assert_eq!(account.deposit(amount("0.0001")), Err(TxError::Overflow));
+        assert_eq!(account, before);
+
+        // Negative side: a hold pushing available below -MAX_BALANCE.
+        let mut account = Account {
+            available: -Account::MAX_BALANCE,
+            held: Account::MAX_BALANCE,
+            locked: false,
+        };
+        let before = account.clone();
+        assert_eq!(account.hold(amount("0.0001")), Err(TxError::Overflow));
         assert_eq!(account, before);
     }
 }
